@@ -1,0 +1,17 @@
+{
+  "seed": 2026,
+  "threads": 2,
+  "device": "auto",
+  "inference_batch_size": 512,
+  "retrieval": {
+    "enabled": true,
+    "weight": 0.5,
+    "neighbors": 128,
+    "max_len": 20,
+    "horizon": 5
+  },
+  "memory": {
+    "enabled": true,
+    "weight": 0.5
+  }
+}

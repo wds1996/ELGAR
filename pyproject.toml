@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elgar"
+version = "0.1.0"
+description = "Local retrieval and global predictive memory for frozen sequential recommenders"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "backbone/SASRec/LICENSE.txt"]
+dependencies = [
+    "numpy>=1.24,<2",
+    "scipy>=1.10",
+    "torch>=2.1",
+    "numba>=0.59",
+    "threadpoolctl>=3.1",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+read = ["pandas>=1.5,<2", "scikit-learn>=1.4", "faiss-cpu>=1.8,<2",
+        "colorlog>=6.9", "colorama>=0.4"]
+data = ["gdown>=5.2"]
+fave = ["timm>=0.9"]
+
+[project.scripts]
+elgar-evaluate = "elgar.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["elgar", "backbone", "backbone.*", "dataset"]
+
+[tool.setuptools.package-data]
+dataset = ["README.md"]
+backbone = ["README.md"]
+"backbone.SASRec" = ["README.md", "LICENSE.txt"]
+"backbone.DuoRec" = ["README.md"]
+"backbone.FAVE" = ["README.md"]

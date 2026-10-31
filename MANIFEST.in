@@ -1,0 +1,4 @@
+include .gitignore README.md THIRD_PARTY_NOTICES.md LICENSE constraints-reproduce.txt
+include config/default.json
+recursive-include backbone *.md *.txt
+recursive-include dataset *.py *.md
