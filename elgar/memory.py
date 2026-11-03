@@ -1,9 +1,3 @@
-"""One train-only predictive memory: observed prefix -> next item.
-
-A single signed ridge map replaces basket reconstruction and the four-view mean.
-No backbone scores, retrieval scores, validation labels, consumed-item mask,
-user-specific gate, or hand-tuned internal fusion coefficient is used here.
-"""
 from __future__ import annotations
 
 import json
@@ -25,7 +19,7 @@ from .progress import progress, stage
 RELATION_SCHEMA = "elgar-next-item-memory-v1"
 DEFAULT_CACHE_ROOT = Path('cache')
 
-
+# 根据数据集路径生成默认缓存目录
 def default_memory_cache(dataset_path: str | Path) -> Path:
     path = Path(dataset_path)
     name = path.parent.name if path.stem == 'dataset' else path.stem
@@ -33,7 +27,7 @@ def default_memory_cache(dataset_path: str | Path) -> Path:
         raise ValueError('Cannot determine dataset name for the memory cache.')
     return DEFAULT_CACHE_ROOT / f'{name}_memory'
 
-
+# 将用户序列转换为 Recency-weighted Vector
 def history_matrix(histories, num_items: int) -> sparse.csr_matrix:
     """Normalized reciprocal event-age features over the full observed prefix.
 
@@ -43,17 +37,21 @@ def history_matrix(histories, num_items: int) -> sparse.csr_matrix:
     histories = validate_histories(histories, num_items)
     rows, cols, values = [], [], []
     for row, history in enumerate(histories):
+        # 生成倒数间隔权重
         weights = 1.0 / np.arange(len(history), 0, -1, dtype=np.float32)
+        # 归一化
         weights /= weights.sum()
+        # 写入稀疏矩阵索引
         rows.extend([row] * len(history))
         cols.extend((history - 1).tolist())
         values.extend(weights.tolist())
+    # [Query数量,N]
     return sparse.csr_matrix(
         (np.asarray(values, dtype=np.float32), (rows, cols)),
         shape=(len(histories), num_items), dtype=np.float32,
     )
 
-
+# 把所有训练序列展开成监督样本
 @njit(cache=True, nogil=True)
 def _fill_training(sequences, offsets, indptr, indices, values, targets):
     row = 0
@@ -73,7 +71,7 @@ def _fill_training(sequences, offsets, indptr, indices, values, targets):
             row += 1
     indptr[row] = position
 
-
+# 构造训练矩阵 X 和 Y
 def training_matrices(train: dict, num_items: int):
     """Every training event after the first contributes one causal (x, y) pair."""
     if not isinstance(train, dict) or not train:
@@ -82,15 +80,18 @@ def training_matrices(train: dict, num_items: int):
     lengths = np.asarray([len(sequence) for sequence in sequences], np.int64)
     if np.any(lengths < 2):
         raise ValueError("Each source user must have at least two training events.")
+    
     count = int(np.sum(lengths-1))
     nnz = int(np.sum(lengths*(lengths-1)//2))
     indptr = np.empty(count+1, np.int64)
     indices = np.empty(nnz, np.int32)
     values = np.empty(nnz, np.float32)
     targets = np.empty(count, np.int32)
+    # 构建 X
     with stage('[memory] Building training samples'):
         _fill_training(np.concatenate(sequences), np.r_[0, np.cumsum(lengths)],
                        indptr, indices, values, targets)
+    # 构建 Y
     with stage('[memory] Building sparse matrices'):
         x = sparse.csr_matrix((values, indices, indptr), shape=(count, num_items), dtype=np.float32)
         x.sum_duplicates()
@@ -101,7 +102,7 @@ def training_matrices(train: dict, num_items: int):
         )
     return x, y
 
-
+# 学习全局预测矩阵 W
 def ridge_map(x: sparse.csr_matrix, y: sparse.csr_matrix, device='cpu') -> np.ndarray:
     """Minimize ||XW-Y||_F^2 + sum_i (sum_t X_ti^2 + 1) ||W_i||_2^2.
 
@@ -115,22 +116,20 @@ def ridge_map(x: sparse.csr_matrix, y: sparse.csr_matrix, device='cpu') -> np.nd
         gram = (x.T @ x).toarray(order="F")
     with stage('[memory] Computing X.T @ Y'):
         rhs = (x.T @ y).toarray(order="F")
+    # 正则化
     n = gram.shape[0]
     diagonal = np.diag(gram).copy()
     gram.flat[::n + 1] += diagonal + 1.0
+    # GPU Cholesky 求解
     if torch.device(device).type == 'cuda':
         a=torch.from_numpy(np.ascontiguousarray(gram)).to(device)
         torch.cuda.synchronize(device)
         with stage('[memory] GPU Cholesky factorization'):
             factor = torch.linalg.cholesky(a)
             torch.cuda.synchronize(device)
-        # The factor replaces the Gram matrix for the solve. Release its GPU
-        # input so large catalogues need three matrix buffers rather than four.
         del a
         with stage('[memory] Solving memory on GPU'):
             if rhs.nbytes >= 2**31:
-                # Each RHS column is an independent solve with the same factor.
-                # Two triangular solves avoid cuSOLVER's full factor copy.
                 torch.cuda.empty_cache()
                 weights = np.empty_like(rhs, order='F')
                 for lo in range(0, n, 512):
@@ -145,7 +144,8 @@ def ridge_map(x: sparse.csr_matrix, y: sparse.csr_matrix, device='cpu') -> np.nd
         if not np.isfinite(weights).all():
             raise FloatingPointError("Predictive memory contains nonfinite coefficients.")
         return weights
-    # A fixed reduction environment keeps fresh fits reproducible in this build.
+    
+    # CPU Cholesky 求解
     with threadpool_limits(limits=2, user_api="blas"):
         with stage('[memory] CPU Cholesky factorization'):
             factor, info = linalg.lapack.spotrf(gram, lower=1, overwrite_a=1, clean=0)
@@ -159,7 +159,7 @@ def ridge_map(x: sparse.csr_matrix, y: sparse.csr_matrix, device='cpu') -> np.nd
         raise FloatingPointError("Predictive memory contains nonfinite coefficients.")
     return weights
 
-
+# 主类，保存、加载和查询 W
 class ItemMemory:
     """One matrix, one query representation and one externally weighted output."""
     def __init__(self, matrix: np.ndarray, metadata: dict, device='cpu'):
@@ -207,8 +207,7 @@ class ItemMemory:
         try:
             with tempfile.NamedTemporaryFile(dir=folder, suffix=".tmp", delete=False) as handle:
                 temporary = handle.name
-            # CSR @ dense requires a C-contiguous RHS. A Fortran-layout cache
-            # would otherwise copy the entire N x N matrix for EVERY query batch.
+            
             mapped = np.lib.format.open_memmap(temporary, mode="w+", dtype=np.float32,
                                                shape=(num_items, num_items), fortran_order=False)
             for lo in progress(range(0, num_items, 128),desc='[memory] Saving cache',unit='batch'):
@@ -227,11 +226,12 @@ class ItemMemory:
         write_json(meta_path, metadata)
         return cls(np.load(matrix_path, mmap_mode="r", allow_pickle=False), metadata, device=device)
 
+    # 使用当前历史查询记忆
     def score(self, histories) -> np.ndarray:
         """All real items, no labels, no observed-item filtering, bounded correction."""
         if self.device.type == 'cuda':
             x=history_matrix(histories,self.n)
-            # Sparse query vectors are small; the dense memory remains on GPU.
+            
             query=torch.sparse_csr_tensor(torch.from_numpy(x.indptr.astype(np.int64)).to(self.device),
                 torch.from_numpy(x.indices.astype(np.int64)).to(self.device),
                 torch.from_numpy(x.data.copy()).to(self.device),size=x.shape,device=self.device)
