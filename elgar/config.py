@@ -1,4 +1,3 @@
-"""Inference-only configuration for a separately trained backbone."""
 from __future__ import annotations
 import json
 import math
