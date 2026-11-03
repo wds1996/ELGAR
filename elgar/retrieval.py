@@ -1,8 +1,3 @@
-"""Exact train-only case retrieval, independent of learned evidence strength.
-
-One best case per source user, query-user exclusion, deterministic score/ID
-ordering. CSR construction and source reduction avoid huge Python intermediates.
-"""
 from __future__ import annotations
 from dataclasses import dataclass
 import hashlib,json
@@ -17,44 +12,54 @@ from .progress import progress, stage
 
 GPU_SCORE_ELEMENTS = 4_000_000
 
-
+# 生成全部 Prefix–Continuation 案例
 @njit(cache=True, nogil=True)
 def _fill_cases(sequences, offsets, users, idf, max_len, horizon,
                 indptr, indices, values, source, groups, outcomes, weights):
     row=0;ptr=0
     for u in range(len(users)):
-        start=offsets[u];length=offsets[u+1]-start
+        start=offsets[u]
+        length=offsets[u+1]-start
         for end in range(1,length):
             source[row]=users[u];groups[row]=u;indptr[row]=ptr
             first=max(0,end-max_len)
             for t in range(first,end):
-                item=sequences[start+t];indices[ptr]=item
+                item=sequences[start+t]
+                indices[ptr]=item
                 w=idf[item]
                 values[ptr]=w;ptr+=1
             count=min(horizon,length-end)
             for t in range(count):
-                outcomes[row,t]=sequences[start+end+t];weights[row,t]=np.float32(1.0/count)
+                outcomes[row,t]=sequences[start+end+t]
+                weights[row,t]=np.float32(1.0/count)
             row+=1
     indptr[row]=ptr
 
 
+# Source-user Deduplication 用户级去重
 @njit(cache=True)
 def _best_sources(ids,scores,groups,users,query_user):
-    best=np.zeros(len(users),np.float32);cases=np.full(len(users),-1,np.int64)
-    touched=np.empty(len(users),np.int64);n=0
+    best=np.zeros(len(users),np.float32)
+    cases=np.full(len(users),-1,np.int64)
+    touched=np.empty(len(users),np.int64)
+    n=0
     for j in range(len(ids)):
         c=ids[j];u=groups[c];s=scores[j]
         if users[u]==query_user or s<=0:continue
         if cases[u]<0:
-            touched[n]=u;n+=1;best[u]=s;cases[u]=c
+            touched[n]=u
+            n+=1
+            best[u]=s
+            cases[u]=c
         elif s>best[u] or (s==best[u] and c<cases[u]):
             best[u]=s;cases[u]=c
-    result=np.empty(n,np.int64);ss=np.empty(n,np.float32)
+    result=np.empty(n,np.int64)
+    ss=np.empty(n,np.float32)
     for j in range(n):
         u=touched[j];result[j]=cases[u];ss[j]=best[u]
     return result,ss
 
-
+# 检索结果的数据结构
 @dataclass
 class Retrieved:
     cases: np.ndarray
@@ -65,32 +70,50 @@ class Retrieved:
 
 class Retriever:
     def __init__(self,train:dict,num_items:int,config:RetrievalConfig,device='cpu',*,one_case_per_source=True):
-        if not isinstance(train,dict) or not train or not isinstance(config,RetrievalConfig):raise ValueError('Invalid training memory.')
-        if type(num_items) is not int or num_items<1:raise ValueError('num_items must be a positive integer.')
-        if type(one_case_per_source) is not bool:raise ValueError('one_case_per_source must be boolean.')
-        self.n=num_items;self.config=config;self.device=torch.device(device)
+        if not isinstance(train,dict) or not train or not isinstance(config,RetrievalConfig):
+            raise ValueError('Invalid training memory.')
+        if type(num_items) is not int or num_items<1:
+            raise ValueError('num_items must be a positive integer.')
+        if type(one_case_per_source) is not bool:
+            raise ValueError('one_case_per_source must be boolean.')
+        self.n=num_items;self.config=config
+        self.device=torch.device(device)
         self.one_case_per_source=one_case_per_source
         if any(type(u) is not int or not 0 <= u < 2**63 for u in train):
             raise ValueError('Source user IDs must be nonnegative int64 integers.')
-        users=np.asarray(sorted(train),np.int64);histories=validate_histories([train[int(u)] for u in users],num_items)
+        
+        users=np.asarray(sorted(train),np.int64)
+        histories=validate_histories([train[int(u)] for u in users],num_items)
         lengths=np.asarray([len(h) for h in histories],np.int64)
-        if np.any(lengths<2):raise ValueError('Source histories require at least two events.')
+        if np.any(lengths<2):
+            raise ValueError('Source histories require at least two events.')
+        # 计算 IDF
         df=np.zeros(num_items+1,np.int64)
-        for h in progress(histories,desc='[retrieval] Item frequencies',unit='user'):df[np.unique(h)]+=1
-        self.idf=(np.log((1.+len(users))/(1.+df))+1.).astype(np.float32);self.idf[0]=0
-        count=int(np.sum(lengths-1));limit=config.max_len
+        for h in progress(histories,desc='[retrieval] Item frequencies',unit='user'):
+            df[np.unique(h)]+=1
+        self.idf=(np.log((1.+len(users))/(1.+df))+1.).astype(np.float32)
+        self.idf[0]=0
+        
+        # 预分配数组并填充案例
+        count=int(np.sum(lengths-1))
+        limit=config.max_len
         # Sum min(end,L) for end=1..length-1.
         last=lengths-1;m=np.minimum(last,limit)
         nnz=int(np.sum(m*(m+1)//2+np.maximum(last-limit,0)*limit))
-        indptr=np.empty(count+1,np.int64);indices=np.empty(nnz,np.int32);values=np.empty(nnz,np.float32)
-        self.sources=np.empty(count,np.int64);self.groups=np.empty(count,np.int32);self.users=users
+        indptr=np.empty(count+1,np.int64);indices=np.empty(nnz,np.int32)
+        values=np.empty(nnz,np.float32)
+        self.sources=np.empty(count,np.int64)
+        self.groups=np.empty(count,np.int32);self.users=users
         self.outcome_ids=np.zeros((count,config.horizon),np.int32)
         self.outcome_weights=np.zeros((count,config.horizon),np.float32)
         with stage('[retrieval] Building retrieval cases'):
             _fill_cases(np.concatenate(histories),np.r_[0,np.cumsum(lengths)],users,self.idf,limit,config.horizon,
                         indptr,indices,values,self.sources,self.groups,self.outcome_ids,self.outcome_weights)
+        # 预分配数组并填充案例
         with stage('[retrieval] Building sparse index'):
-            x=sparse.csr_matrix((values,indices,indptr),shape=(count,num_items+1));x.sum_duplicates();x.sort_indices()
+            x=sparse.csr_matrix((values,indices,indptr),shape=(count,num_items+1))
+            x.sum_duplicates()
+            x.sort_indices()
             norm=np.sqrt(np.asarray(x.multiply(x).sum(1)).ravel())
             self.matrix=(sparse.diags(1/np.maximum(norm,1e-12))@x).tocsr().astype(np.float32)
             self.matrix.sort_indices()
@@ -109,38 +132,52 @@ class Retriever:
                                               'one_case_per_source':one_case_per_source},sort_keys=True).encode()).hexdigest()
         print(f'[retrieval] {count:,} cases / {len(users):,} sources / {self.matrix.nnz:,} nonzeros',flush=True)
 
+    # 把当前 Query 变成 TF-IDF 向量
     def _features(self,histories):
         rows=[];cols=[];values=[]
         for row,history in enumerate(histories):
-            h=history[-self.config.max_len:];w=self.idf[h]
-            rows.extend([row]*len(h));cols.extend(h.tolist());values.extend(w.tolist())
+            h=history[-self.config.max_len:]
+            w=self.idf[h]
+            rows.extend([row]*len(h));cols.extend(h.tolist())
+            values.extend(w.tolist())
         x=sparse.csr_matrix((np.asarray(values,np.float32),(rows,cols)),shape=(len(histories),self.n+1),dtype=np.float32)
         norm=np.sqrt(np.asarray(x.multiply(x).sum(1)).ravel())
         return (sparse.diags(1/np.maximum(norm,1e-12),format='csr')@x).astype(np.float32)
 
+    # 检索入口
     def retrieve(self,histories,query_users):
-        hs=validate_histories(histories,self.n);users=np.asarray(query_users)
-        if users.shape!=(len(hs),) or users.dtype.kind not in 'iu' or np.any(users<0) or np.any(users>np.iinfo(np.int64).max):raise ValueError('One nonnegative integer user per query is required.')
+        hs=validate_histories(histories,self.n)
+        users=np.asarray(query_users)
+        if users.shape!=(len(hs),) or users.dtype.kind not in 'iu' or np.any(users<0) or np.any(users>np.iinfo(np.int64).max):
+            raise ValueError('One nonnegative integer user per query is required.')
         if self.device.type == 'cuda':
             return self._retrieve_gpu(hs,users.astype(np.int64))
-        k=self.config.neighbors;cases=np.full((len(hs),k),-1,np.int64);sim=np.zeros((len(hs),k),np.float32)
+        
+        k=self.config.neighbors
+        cases=np.full((len(hs),k),-1,np.int64)
+        sim=np.zeros((len(hs),k),np.float32)
+        
         for lo in range(0,len(hs),16):
             product=(self._features(hs[lo:lo+16])@self.transpose).tocsr()
             for j in range(product.shape[0]):
                 start,end=product.indptr[j:j+2]
+                # 每个查询执行来源去重
                 if self.one_case_per_source:
                     ids,ss=_best_sources(product.indices[start:end],product.data[start:end],self.groups,self.users,int(users[lo+j]))
                 else:
                     ids,ss=product.indices[start:end],product.data[start:end]
                     keep=(ss>0)&(self.sources[ids]!=users[lo+j])
                     ids,ss=ids[keep],ss[keep]
+                # # 每个查询执行来源去重
                 if len(ss)>k:
                     threshold=np.partition(ss,len(ss)-k)[len(ss)-k]
-                    keep=ss>=threshold;ids=ids[keep];ss=ss[keep]
+                    keep=ss>=threshold;ids=ids[keep]
+                    ss=ss[keep]
                 order=np.lexsort((ids,-ss))[:k]
                 cases[lo+j,:len(order)]=ids[order];sim[lo+j,:len(order)]=ss[order]
         return Retrieved(cases,sim,users.astype(np.int64),self.digest)
 
+    # GPU 检索
     @torch.inference_mode()
     def _retrieve_gpu(self,histories,users):
         """Score bounded case chunks on CUDA and reduce to one case per source."""
@@ -193,6 +230,7 @@ class Retriever:
         return Retrieved(torch.cat(result_cases),torch.cat(result_scores),
                          torch.from_numpy(users).to(self.device),self.digest)
 
+    # 不去重的 GPU 检索
     @torch.inference_mode()
     def _retrieve_gpu_unrestricted(self,histories,users):
         """Exact top-K cases with stable score/case-ID ordering and no self cases."""
@@ -215,8 +253,7 @@ class Retriever:
                     size=(end-start,self.n+1),device=self.device)
                 scores=torch.sparse.mm(index,query).T.contiguous()
                 ids=torch.arange(start,end,device=self.device,dtype=torch.int64)[None,:]
-                # Positive float32 bit patterns sort exactly like their values.
-                # The low bits prefer smaller case IDs when similarities tie.
+
                 keys=(scores.view(torch.int32).to(torch.int64)<<32)|(0xffffffff-ids)
                 own=self._users[self._groups[start:end]]==query_users[:,None]
                 keys=torch.where((scores>0)&~own,keys,-1)
@@ -234,20 +271,31 @@ class Retriever:
         return Retrieved(torch.cat(result_cases),torch.cat(result_scores),
                          torch.from_numpy(users).to(self.device),self.digest)
 
+    # 把检索案例转换为物品支持
     def evidence(self,retrieved):
-        if not isinstance(retrieved,Retrieved) or retrieved.memory_digest!=self.digest:raise ValueError('Mismatched retrieval result.')
+        # 检查版本标识、案例编号、相似度是否有效
+        if not isinstance(retrieved,Retrieved) or retrieved.memory_digest!=self.digest:
+            raise ValueError('Mismatched retrieval result.')
         if isinstance(retrieved.cases,torch.Tensor):
             return self._evidence_gpu(retrieved)
         cases,sim=retrieved.cases,retrieved.similarities
-        if cases.ndim!=2 or cases.shape!=sim.shape or not np.isfinite(sim).all() or np.any(sim<0) or np.any((cases< -1)|(cases>=len(self.sources))):raise ValueError('Invalid retrieval arrays.')
+        if cases.ndim!=2 or cases.shape!=sim.shape or not np.isfinite(sim).all() or np.any(sim<0) or np.any((cases< -1)|(cases>=len(self.sources))):
+            raise ValueError('Invalid retrieval arrays.')
         valid=cases>=0;ix=cases.clip(0)
         for row in range(len(cases)):
             u=self.sources[ix[row,valid[row]]]
-            if np.any(u==retrieved.query_users[row]):raise ValueError('Source leakage.')
-            if self.one_case_per_source and len(np.unique(u))!=len(u):raise ValueError('Repeated source.')
-        ids=self.outcome_ids[ix];weight=(sim[:,:,None]*self.outcome_weights[ix]*valid[:,:,None]).astype(np.float32)
+            if np.any(u==retrieved.query_users[row]):
+                raise ValueError('Source leakage.')
+            if self.one_case_per_source and len(np.unique(u))!=len(u):
+                raise ValueError('Repeated source.')
+        
+        # 计算每个后续物品的加权支持
+        ids=self.outcome_ids[ix]
+        weight=(sim[:,:,None]*self.outcome_weights[ix]*valid[:,:,None]).astype(np.float32)
+        # 汇总到完整物品目录
         rows=np.broadcast_to(np.arange(len(cases))[:,None,None],ids.shape)
-        out=np.zeros((len(cases),self.n+1),np.float32);np.add.at(out,(rows.ravel(),ids.ravel()),weight.ravel());out[:,0]=0
+        out=np.zeros((len(cases),self.n+1),np.float32)
+        np.add.at(out,(rows.ravel(),ids.ravel()),weight.ravel());out[:,0]=0
         return out
 
     @torch.inference_mode()
@@ -273,4 +321,5 @@ class Retriever:
         out[:,0]=0
         return out
 
-    def query(self,histories,query_users):return self.evidence(self.retrieve(histories,query_users))
+    def query(self,histories,query_users):
+        return self.evidence(self.retrieve(histories,query_users))
