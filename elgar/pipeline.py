@@ -1,4 +1,3 @@
-"""Attach train-only retrieval and memory to an external backbone at inference."""
 from __future__ import annotations
 import numpy as np
 import torch
