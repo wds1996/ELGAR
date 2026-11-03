@@ -1,8 +1,3 @@
-"""Validated leave-one-out data and observed evaluation histories.
-
-Only plain-container pickle files are accepted. Item 0 is padding. The model
-receives only an observed suffix. Full histories feed retrieval and memory.
-"""
 from __future__ import annotations
 
 import pickle
